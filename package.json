@@ -2,7 +2,7 @@
     "name": "grimoire",
     "displayName": "Grimoire",
     "description": "A set of VS Code themes.",
-    "version": "0.0.2",
+    "version": "0.0.3",
     "publisher": "K2E7",
     "license": "GPL-2.0-only",
     "engines": {
