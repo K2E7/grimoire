@@ -1,0 +1,34 @@
+{
+    "name": "grimoire",
+    "displayName": "Grimoire",
+    "description": "A set of VS Code themes.",
+    "version": "0.0.1",
+    "publisher": "K2E7",
+    "license": "GPL-2.0-only",
+    "engines": {
+        "vscode": "^1.90.0"
+    },
+    "categories": [
+        "Themes"
+    ],
+    "contributes": {
+        "themes": [
+            {
+                "label": "Grimoire: Script Dark",
+                "uiTheme": "vs-dark",
+                "path": "./themes/grimoire-script-dark-color-theme.json"
+            }
+        ],
+        "configurationDefaults": {
+            "editor.bracketPairColorization.enabled": true
+        }
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/YOUR_USERNAME/grimoire"
+    },
+    "bugs": {
+        "url": "https://github.com/YOUR_USERNAME/grimoire/issues"
+    },
+    "homepage": "https://github.com/YOUR_USERNAME/grimoire#readme"
+}
