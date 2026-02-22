@@ -1,0 +1,137 @@
+name: Feature Snapshot Build
+
+on:
+  push:
+    branches-ignore:
+      - main
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: feature-snapshot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  snapshot-build:
+    if: github.ref_type == 'branch' && github.ref_name != 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Resolve snapshot version and release metadata
+        id: meta
+        run: |
+          set -euo pipefail
+
+          git fetch origin main --depth=1
+
+          MAIN_VERSION="$(
+            git show origin/main:package.json \
+              | node -e "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{const v=JSON.parse(s).version;console.log(v);});"
+          )"
+          MAIN_BASE="${MAIN_VERSION%%-*}"
+          IFS='.' read -r MAIN_MAJOR MAIN_MINOR _ <<< "$MAIN_BASE"
+
+          if [[ -z "${MAIN_MAJOR:-}" || -z "${MAIN_MINOR:-}" ]]; then
+            echo "::error::Could not parse main version from package.json: $MAIN_VERSION"
+            exit 1
+          fi
+
+          FEATURE_MINOR="$((MAIN_MINOR + 1))"
+          MERGE_BASE="$(git merge-base HEAD origin/main)"
+          COUNT="$(git rev-list --count "${MERGE_BASE}..HEAD")"
+          if (( COUNT <= 0 )); then
+            N=0
+          else
+            N="$((COUNT - 1))"
+          fi
+
+          FEATURE_VERSION="${MAIN_MAJOR}.${FEATURE_MINOR}.${N}-snapshot.${GITHUB_RUN_NUMBER}"
+          BRANCH_SLUG="$(
+            echo "${GITHUB_REF_NAME}" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -E 's|[ /_]+|-|g; s|[^a-z0-9.-]+|-|g; s|-+|-|g; s|^-+||; s|-+$||'
+          )"
+          if [[ -z "$BRANCH_SLUG" ]]; then
+            BRANCH_SLUG="snapshot"
+          fi
+
+          RELEASE_TAG="snapshot-${BRANCH_SLUG}"
+          RELEASE_TITLE="Snapshot ${GITHUB_REF_NAME} @ ${GITHUB_SHA::7}"
+
+          echo "main_version=$MAIN_VERSION"
+          echo "feature_version=$FEATURE_VERSION"
+          echo "release_tag=$RELEASE_TAG"
+          echo "release_title=$RELEASE_TITLE"
+
+          {
+            echo "feature_version=$FEATURE_VERSION"
+            echo "release_tag=$RELEASE_TAG"
+            echo "release_title=$RELEASE_TITLE"
+            echo "branch_slug=$BRANCH_SLUG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set snapshot package version in workspace
+        env:
+          FEATURE_VERSION: ${{ steps.meta.outputs.feature_version }}
+        run: |
+          set -euo pipefail
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.env.FEATURE_VERSION;fs.writeFileSync('package.json', JSON.stringify(p,null,4)+'\n');"
+          echo "package.json version set to $FEATURE_VERSION for this build only."
+
+      - name: Install vsce
+        run: npm install -g @vscode/vsce
+
+      - name: Package VSIX
+        id: package
+        run: |
+          set -euo pipefail
+          vsce package
+          VSIX_FILE="$(ls -1 *.vsix | head -n 1)"
+          if [[ -z "$VSIX_FILE" ]]; then
+            echo "::error::No VSIX produced."
+            exit 1
+          fi
+          echo "vsix_file=$VSIX_FILE" >> "$GITHUB_OUTPUT"
+          ls -la "$VSIX_FILE"
+
+      - name: Build release notes
+        run: |
+          set -euo pipefail
+          {
+            echo "Mode: feature snapshot"
+            echo "Branch: ${GITHUB_REF_NAME}"
+            echo "Commit: ${GITHUB_SHA}"
+            echo "Version: ${{ steps.meta.outputs.feature_version }}"
+            echo "Workflow run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > release-notes.txt
+
+      - name: Create/Update rolling snapshot prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.meta.outputs.release_tag }}"
+          TITLE="${{ steps.meta.outputs.release_title }}"
+          VSIX_FILE="${{ steps.package.outputs.vsix_file }}"
+          NOTES_FILE="release-notes.txt"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Updating existing snapshot release $TAG"
+            gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE" --target "$GITHUB_SHA" --prerelease
+            gh release upload "$TAG" "$VSIX_FILE" --clobber
+          else
+            echo "Creating snapshot prerelease $TAG"
+            gh release create "$TAG" "$VSIX_FILE" --title "$TITLE" --notes-file "$NOTES_FILE" --target "$GITHUB_SHA" --prerelease
+          fi

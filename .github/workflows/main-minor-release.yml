@@ -1,0 +1,171 @@
+name: Main Minor Stable Release
+
+on:
+  pull_request:
+    types:
+      - closed
+
+permissions:
+  contents: write
+
+concurrency:
+  group: main-minor-release-main
+  cancel-in-progress: false
+
+jobs:
+  minor-release:
+    if: "${{ github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' && !startsWith(github.event.pull_request.title, 'chore(release): set version to v') }}"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Resolve target stable version
+        id: meta
+        env:
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin main --tags
+          git checkout -B main origin/main
+
+          MERGED_VERSION="$(
+            git show "${MERGE_SHA}:package.json" \
+              | node -e "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{const v=JSON.parse(s).version;console.log(v);});"
+          )"
+          BASE_VERSION="$(
+            git show "${BASE_SHA}:package.json" \
+              | node -e "let s='';process.stdin.on('data',d=>s+=d);process.stdin.on('end',()=>{const v=JSON.parse(s).version;console.log(v);});"
+          )"
+
+          MERGED_BASE="${MERGED_VERSION%%-*}"
+          BASE_BASE="${BASE_VERSION%%-*}"
+
+          IFS='.' read -r MERGED_MAJOR MERGED_MINOR _ <<< "$MERGED_BASE"
+          IFS='.' read -r BASE_MAJOR BASE_MINOR _ <<< "$BASE_BASE"
+
+          if [[ -z "${MERGED_MAJOR:-}" || -z "${MERGED_MINOR:-}" || -z "${BASE_MAJOR:-}" || -z "${BASE_MINOR:-}" ]]; then
+            echo "::error::Failed to parse version(s). merged=${MERGED_VERSION}, base=${BASE_VERSION}"
+            exit 1
+          fi
+
+          if [[ "$MERGED_MAJOR" != "$BASE_MAJOR" || "$MERGED_MINOR" != "$BASE_MINOR" ]]; then
+            TARGET_MAJOR="$MERGED_MAJOR"
+            TARGET_MINOR="$MERGED_MINOR"
+            REASON="PR changed major/minor; respecting merged version line."
+          else
+            TARGET_MAJOR="$BASE_MAJOR"
+            TARGET_MINOR="$((BASE_MINOR + 1))"
+            REASON="PR did not change major/minor; auto-incrementing minor."
+          fi
+
+          TARGET_VERSION="${TARGET_MAJOR}.${TARGET_MINOR}.0"
+          TARGET_TAG="v${TARGET_VERSION}"
+
+          echo "merged_version=$MERGED_VERSION"
+          echo "base_version=$BASE_VERSION"
+          echo "target_version=$TARGET_VERSION"
+          echo "target_tag=$TARGET_TAG"
+          echo "reason=$REASON"
+
+          {
+            echo "merged_version=$MERGED_VERSION"
+            echo "base_version=$BASE_VERSION"
+            echo "target_version=$TARGET_VERSION"
+            echo "target_tag=$TARGET_TAG"
+            echo "reason=$REASON"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Ensure target tag is unique
+        run: |
+          set -euo pipefail
+          TARGET_TAG="${{ steps.meta.outputs.target_tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TARGET_TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag collision: ${TARGET_TAG} already exists on origin."
+            exit 1
+          fi
+
+      - name: Apply version, commit to main, and create tag
+        id: persist
+        env:
+          TARGET_VERSION: ${{ steps.meta.outputs.target_version }}
+          TARGET_TAG: ${{ steps.meta.outputs.target_tag }}
+        run: |
+          set -euo pipefail
+
+          node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.version=process.env.TARGET_VERSION;fs.writeFileSync('package.json', JSON.stringify(p,null,4)+'\n');"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git diff --quiet -- package.json; then
+            git add package.json
+            git commit -m "chore(release): set version to ${TARGET_TAG}"
+            git push origin HEAD:main
+            echo "committed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "package.json already at ${TARGET_VERSION}; no commit needed."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          git tag -a "${TARGET_TAG}" -m "Release ${TARGET_TAG}"
+          git push origin "${TARGET_TAG}"
+
+      - name: Install vsce
+        run: npm install -g @vscode/vsce
+
+      - name: Package VSIX
+        id: package
+        run: |
+          set -euo pipefail
+          vsce package
+          VSIX_FILE="$(ls -1 *.vsix | head -n 1)"
+          if [[ -z "$VSIX_FILE" ]]; then
+            echo "::error::No VSIX produced."
+            exit 1
+          fi
+          echo "vsix_file=$VSIX_FILE" >> "$GITHUB_OUTPUT"
+          ls -la "$VSIX_FILE"
+
+      - name: Build stable release notes
+        run: |
+          set -euo pipefail
+          {
+            echo "Mode: main stable release"
+            echo "PR: #${{ github.event.pull_request.number }}"
+            echo "Source branch: ${{ github.event.pull_request.head.ref }}"
+            echo "Merge commit: ${{ github.event.pull_request.merge_commit_sha }}"
+            echo "Package version: ${{ steps.meta.outputs.target_version }}"
+            echo "Version decision: ${{ steps.meta.outputs.reason }}"
+            echo "Workflow run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > release-notes.txt
+
+      - name: Create/Update stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.meta.outputs.target_tag }}"
+          TITLE="Release ${TAG}"
+          VSIX_FILE="${{ steps.package.outputs.vsix_file }}"
+          NOTES_FILE="release-notes.txt"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; updating and replacing VSIX."
+            gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE"
+            gh release upload "$TAG" "$VSIX_FILE" --clobber
+          else
+            echo "Creating stable release $TAG"
+            gh release create "$TAG" "$VSIX_FILE" --title "$TITLE" --notes-file "$NOTES_FILE"
+          fi
