@@ -42,8 +42,17 @@ jobs:
           vsce package
           ls -la *.vsix
 
-      - name: Create GitHub Release and upload VSIX
-        uses: softprops/action-gh-release@v2
-        with:
-          files: "*.vsix"
-          generate_release_notes: true
+      - name: Create/Update GitHub Release and upload VSIX
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          VSIX_FILE="$(ls -1 *.vsix | head -n 1)"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading asset with clobber."
+            gh release upload "$TAG" "$VSIX_FILE" --clobber
+          else
+            echo "Creating release $TAG and uploading asset."
+            gh release create "$TAG" "$VSIX_FILE" --generate-notes --title "Release $TAG"
+          fi
