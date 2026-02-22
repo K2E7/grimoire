@@ -2,6 +2,8 @@ name: Release VSIX
 
 on:
   push:
+    branches:
+      - "**"
     tags:
       - "v*.*.*"
   workflow_dispatch: {}
@@ -15,44 +17,180 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Verify tag matches package.json version
+      - name: Resolve release metadata
+        id: meta
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          set -euo pipefail
+
           PKG_VERSION="$(node -p "require('./package.json').version")"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          REF_TYPE="${GITHUB_REF_TYPE}"
+          REF_NAME="${GITHUB_REF_NAME}"
 
-          echo "Tag version: $TAG"
-          echo "package.json version: $PKG_VERSION"
+          RELEASE_MODE=""
+          RELEASE_TAG=""
+          RELEASE_TITLE=""
+          IS_PRERELEASE="false"
+          IS_ROLLING="false"
+          BRANCH_SLUG=""
 
-          if [ "$TAG" != "$PKG_VERSION" ]; then
-            echo "::error::Version mismatch. Tag is v$TAG but package.json is $PKG_VERSION"
+          if [[ "$REF_TYPE" == "tag" && "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            RELEASE_MODE="semver_tag"
+            RELEASE_TAG="$REF_NAME"
+            RELEASE_TITLE="Release $REF_NAME"
+          elif [[ "$REF_TYPE" == "branch" && "$REF_NAME" == "main" ]]; then
+            RELEASE_MODE="main_build"
+            RELEASE_TAG="main-$SHORT_SHA"
+            RELEASE_TITLE="Main build $SHORT_SHA"
+          else
+            RELEASE_MODE="branch_snapshot"
+            BRANCH_SLUG="$(
+              echo "$REF_NAME" \
+                | tr '[:upper:]' '[:lower:]' \
+                | sed -E 's|[ /_]+|-|g; s|[^a-z0-9.-]+|-|g; s|-+|-|g; s|^-+||; s|-+$||'
+            )"
+            if [[ -z "$BRANCH_SLUG" ]]; then
+              BRANCH_SLUG="snapshot"
+            fi
+            RELEASE_TAG="snapshot-$BRANCH_SLUG"
+            RELEASE_TITLE="Snapshot $REF_NAME @ $SHORT_SHA"
+            IS_PRERELEASE="true"
+            IS_ROLLING="true"
+          fi
+
+          {
+            echo "release_mode=$RELEASE_MODE"
+            echo "release_tag=$RELEASE_TAG"
+            echo "release_title=$RELEASE_TITLE"
+            echo "is_prerelease=$IS_PRERELEASE"
+            echo "is_rolling=$IS_ROLLING"
+            echo "pkg_version=$PKG_VERSION"
+            echo "branch_slug=$BRANCH_SLUG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate semver tag major/minor vs package.json
+        if: steps.meta.outputs.release_mode == 'semver_tag'
+        run: |
+          set -euo pipefail
+
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="${{ steps.meta.outputs.pkg_version }}"
+          PKG_BASE="${PKG_VERSION%%-*}"
+
+          IFS='.' read -r TAG_MAJOR TAG_MINOR _ <<< "$TAG_VERSION"
+          IFS='.' read -r PKG_MAJOR PKG_MINOR _ <<< "$PKG_BASE"
+
+          echo "Tag version: $TAG_VERSION"
+          echo "Package version: $PKG_VERSION"
+          echo "Comparing major.minor => ${TAG_MAJOR}.${TAG_MINOR} vs ${PKG_MAJOR}.${PKG_MINOR}"
+
+          if [[ "$TAG_MAJOR" != "$PKG_MAJOR" || "$TAG_MINOR" != "$PKG_MINOR" ]]; then
+            echo "::error::Version mismatch. Tag major/minor (${TAG_MAJOR}.${TAG_MINOR}) does not match package.json (${PKG_MAJOR}.${PKG_MINOR})"
             exit 1
           fi
+
+      - name: Auto-create/push semver tag from package.json on main version changes
+        if: github.event_name == 'push' && steps.meta.outputs.release_mode == 'main_build'
+        run: |
+          set -euo pipefail
+
+          BEFORE_SHA="${{ github.event.before }}"
+          AFTER_SHA="${GITHUB_SHA}"
+
+          if [[ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            CHANGED_FILES="$(git show --name-only --pretty='' "$AFTER_SHA")"
+          else
+            CHANGED_FILES="$(git diff --name-only "$BEFORE_SHA" "$AFTER_SHA")"
+          fi
+
+          if ! echo "$CHANGED_FILES" | grep -qx "package.json"; then
+            echo "package.json not changed in this push; skipping semver tag sync."
+            exit 0
+          fi
+
+          SEMVER_TAG="v${{ steps.meta.outputs.pkg_version }}"
+          echo "package.json changed; ensuring tag $SEMVER_TAG exists on origin."
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$SEMVER_TAG" >/dev/null 2>&1; then
+            echo "Tag $SEMVER_TAG already exists on origin; nothing to do."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git rev-parse -q --verify "refs/tags/$SEMVER_TAG" >/dev/null 2>&1; then
+            git tag -a "$SEMVER_TAG" -m "Release $SEMVER_TAG"
+          fi
+
+          git push origin "$SEMVER_TAG"
+          echo "Pushed tag $SEMVER_TAG."
 
       - name: Install vsce
         run: npm install -g @vscode/vsce
 
       - name: Package VSIX
+        id: package
         run: |
+          set -euo pipefail
           vsce package
-          ls -la *.vsix
+          VSIX_FILE="$(ls -1 *.vsix | head -n 1)"
+          if [[ -z "$VSIX_FILE" ]]; then
+            echo "::error::No VSIX file produced by vsce package."
+            exit 1
+          fi
+          echo "vsix_file=$VSIX_FILE" >> "$GITHUB_OUTPUT"
+          ls -la "$VSIX_FILE"
+
+      - name: Build release notes
+        run: |
+          set -euo pipefail
+          {
+            echo "Branch/Ref: ${GITHUB_REF_NAME}"
+            echo "Commit: ${GITHUB_SHA}"
+            echo "Package version: ${{ steps.meta.outputs.pkg_version }}"
+            echo "Workflow run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > release-notes.txt
 
       - name: Create/Update GitHub Release and upload VSIX
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="$GITHUB_REF_NAME"
-          VSIX_FILE="$(ls -1 *.vsix | head -n 1)"
+          set -euo pipefail
+
+          TAG="${{ steps.meta.outputs.release_tag }}"
+          TITLE="${{ steps.meta.outputs.release_title }}"
+          IS_PRERELEASE="${{ steps.meta.outputs.is_prerelease }}"
+          IS_ROLLING="${{ steps.meta.outputs.is_rolling }}"
+          VSIX_FILE="${{ steps.package.outputs.vsix_file }}"
+          NOTES_FILE="release-notes.txt"
+
+          echo "Mode: ${{ steps.meta.outputs.release_mode }}"
+          echo "Tag: $TAG"
+          echo "Title: $TITLE"
+          echo "Prerelease: $IS_PRERELEASE"
+          echo "Rolling: $IS_ROLLING"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists; uploading asset with clobber."
+            echo "Release $TAG exists; updating metadata and replacing VSIX asset."
+            if [[ "$IS_ROLLING" == "true" ]]; then
+              gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE" --target "$GITHUB_SHA"
+            else
+              gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES_FILE"
+            fi
             gh release upload "$TAG" "$VSIX_FILE" --clobber
           else
-            echo "Creating release $TAG and uploading asset."
-            gh release create "$TAG" "$VSIX_FILE" --generate-notes --title "Release $TAG"
+            CREATE_ARGS=("$TAG" "$VSIX_FILE" --title "$TITLE" --notes-file "$NOTES_FILE" --target "$GITHUB_SHA")
+            if [[ "$IS_PRERELEASE" == "true" ]]; then
+              CREATE_ARGS+=(--prerelease)
+            fi
+            gh release create "${CREATE_ARGS[@]}"
           fi
