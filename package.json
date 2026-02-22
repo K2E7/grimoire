@@ -25,10 +25,10 @@
     },
     "repository": {
         "type": "git",
-        "url": "https://github.com/YOUR_USERNAME/grimoire"
+        "url": "https://github.com/K2E7/grimoire"
     },
     "bugs": {
-        "url": "https://github.com/YOUR_USERNAME/grimoire/issues"
+        "url": "https://github.com/K2E7/grimoire/issues"
     },
-    "homepage": "https://github.com/YOUR_USERNAME/grimoire#readme"
+    "homepage": "https://github.com/K2E7/grimoire#readme"
 }
